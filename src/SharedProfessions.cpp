@@ -1,0 +1,293 @@
+#include "Config.h"
+#include "DatabaseEnv.h"
+#include "DBCStores.h"
+#include "Log.h"
+#include "Player.h"
+#include "ScriptMgr.h"
+#include "SpellMgr.h"
+
+#include <unordered_set>
+#include <mutex>
+
+namespace
+{
+    bool enabled = true;
+    bool syncSecondary = true;
+
+    // Anti-recursion guard: tracks player GUIDs currently being synced
+    std::mutex syncMutex;
+    std::unordered_set<uint32> syncingPlayers;
+
+    struct SyncGuard
+    {
+        uint32 guid;
+        bool active;
+
+        SyncGuard(uint32 g) : guid(g), active(false)
+        {
+            std::lock_guard<std::mutex> lock(syncMutex);
+            if (syncingPlayers.find(guid) == syncingPlayers.end())
+            {
+                syncingPlayers.insert(guid);
+                active = true;
+            }
+        }
+
+        ~SyncGuard()
+        {
+            if (active)
+            {
+                std::lock_guard<std::mutex> lock(syncMutex);
+                syncingPlayers.erase(guid);
+            }
+        }
+
+        explicit operator bool() const { return active; }
+    };
+
+    bool IsSyncing(uint32 guid)
+    {
+        std::lock_guard<std::mutex> lock(syncMutex);
+        return syncingPlayers.find(guid) != syncingPlayers.end();
+    }
+
+    bool IsSyncedProfessionSkill(uint32 skillId)
+    {
+        if (IsPrimaryProfessionSkill(skillId))
+            return true;
+
+        if (syncSecondary)
+            return skillId == SKILL_FISHING || skillId == SKILL_COOKING || skillId == SKILL_FIRST_AID;
+
+        return false;
+    }
+
+    uint32 GetProfessionSkillForSpell(uint32 spellId)
+    {
+        auto bounds = sSpellMgr->GetSkillLineAbilityMapBounds(spellId);
+        for (auto itr = bounds.first; itr != bounds.second; ++itr)
+        {
+            uint32 skillId = itr->second->SkillLine;
+            if (IsSyncedProfessionSkill(skillId))
+                return skillId;
+        }
+        return 0;
+    }
+}
+
+class SharedProfessionsWorldScript : public WorldScript
+{
+public:
+    SharedProfessionsWorldScript() : WorldScript("SharedProfessionsWorldScript", {
+        WORLDHOOK_ON_AFTER_CONFIG_LOAD
+    }) { }
+
+    void OnAfterConfigLoad(bool /*reload*/) override
+    {
+        enabled = sConfigMgr->GetOption<bool>("SharedProfessions.Enable", true);
+        syncSecondary = sConfigMgr->GetOption<bool>("SharedProfessions.SyncSecondary", true);
+    }
+};
+
+class SharedProfessionsPlayerScript : public PlayerScript
+{
+public:
+    SharedProfessionsPlayerScript() : PlayerScript("SharedProfessionsPlayerScript", {
+        PLAYERHOOK_ON_LOGIN,
+        PLAYERHOOK_ON_LEARN_SPELL,
+        PLAYERHOOK_ON_UPDATE_SKILL
+    }) { }
+
+    void OnPlayerLogin(Player* player) override
+    {
+        if (!enabled)
+            return;
+
+        uint32 accountId = player->GetSession()->GetAccountId();
+        uint32 guid = player->GetGUID().GetCounter();
+
+        SyncGuard guard(guid);
+        if (!guard)
+            return;
+
+        // Phase 1: Save this character's current profession data to account store
+        SaveCharacterProfessions(player, accountId);
+
+        // Phase 2: Apply account-wide best data to this character
+        ApplyAccountProfessions(player, accountId);
+    }
+
+    void OnPlayerLearnSpell(Player* player, uint32 spellId) override
+    {
+        if (!enabled)
+            return;
+
+        if (IsSyncing(player->GetGUID().GetCounter()))
+            return;
+
+        uint32 skillId = GetProfessionSkillForSpell(spellId);
+        if (!skillId)
+            return;
+
+        uint32 accountId = player->GetSession()->GetAccountId();
+        CharacterDatabase.Execute(
+            "INSERT IGNORE INTO shared_professions_account_spells (account_id, spell_id) VALUES ({}, {})",
+            accountId, spellId);
+
+        // If this spell grants/upgrades a profession skill, sync account data
+        SpellLearnSkillNode const* learnSkill = sSpellMgr->GetSpellLearnSkill(spellId);
+        if (learnSkill && IsSyncedProfessionSkill(learnSkill->skill))
+        {
+            SyncGuard guard(player->GetGUID().GetCounter());
+            if (guard)
+                ApplyAccountProfessions(player, accountId);
+        }
+    }
+
+    void OnPlayerUpdateSkill(Player* player, uint32 skillId, uint32 /*value*/, uint32 /*max*/, uint32 /*step*/, uint32 newValue) override
+    {
+        if (!enabled)
+            return;
+
+        if (IsSyncing(player->GetGUID().GetCounter()))
+            return;
+
+        if (!IsSyncedProfessionSkill(skillId))
+            return;
+
+        uint32 accountId = player->GetSession()->GetAccountId();
+        uint16 maxVal = player->GetPureMaxSkillValue(skillId);
+        uint16 stepVal = player->GetSkillStep(skillId);
+
+        CharacterDatabase.Execute(
+            "INSERT INTO shared_professions_account_skills (account_id, skill_id, value, max_value, step) "
+            "VALUES ({}, {}, {}, {}, {}) "
+            "ON DUPLICATE KEY UPDATE "
+            "value = GREATEST(value, VALUES(value)), "
+            "max_value = GREATEST(max_value, VALUES(max_value)), "
+            "step = GREATEST(step, VALUES(step))",
+            accountId, skillId, newValue, maxVal, stepVal);
+    }
+
+private:
+    void SaveCharacterProfessions(Player* player, uint32 accountId)
+    {
+        for (uint32 i = 0; i < sSkillLineStore.GetNumRows(); ++i)
+        {
+            SkillLineEntry const* skill = sSkillLineStore.LookupEntry(i);
+            if (!skill)
+                continue;
+
+            if (!IsSyncedProfessionSkill(skill->id))
+                continue;
+
+            if (!player->HasSkill(skill->id))
+                continue;
+
+            uint16 value = player->GetSkillValue(skill->id);
+            uint16 maxVal = player->GetPureMaxSkillValue(skill->id);
+            uint16 step = player->GetSkillStep(skill->id);
+
+            // UPSERT skill with GREATEST to keep the best values
+            CharacterDatabase.Execute(
+                "INSERT INTO shared_professions_account_skills (account_id, skill_id, value, max_value, step) "
+                "VALUES ({}, {}, {}, {}, {}) "
+                "ON DUPLICATE KEY UPDATE "
+                "value = GREATEST(value, VALUES(value)), "
+                "max_value = GREATEST(max_value, VALUES(max_value)), "
+                "step = GREATEST(step, VALUES(step))",
+                accountId, skill->id, value, maxVal, step);
+
+            // Save all known recipe spells for this profession
+            SaveCharacterRecipes(player, accountId, skill->id);
+        }
+    }
+
+    void SaveCharacterRecipes(Player* player, uint32 accountId, uint32 skillId)
+    {
+        // Iterate all skill line abilities to find spells belonging to this skill
+        for (uint32 j = 0; j < sSkillLineAbilityStore.GetNumRows(); ++j)
+        {
+            SkillLineAbilityEntry const* ability = sSkillLineAbilityStore.LookupEntry(j);
+            if (!ability)
+                continue;
+
+            if (ability->SkillLine != skillId)
+                continue;
+
+            if (player->HasSpell(ability->Spell))
+            {
+                CharacterDatabase.Execute(
+                    "INSERT IGNORE INTO shared_professions_account_spells (account_id, spell_id) VALUES ({}, {})",
+                    accountId, ability->Spell);
+            }
+        }
+    }
+
+    void ApplyAccountProfessions(Player* player, uint32 accountId)
+    {
+        // Apply skill levels
+        QueryResult skillResult = CharacterDatabase.Query(
+            "SELECT skill_id, value, max_value, step FROM shared_professions_account_skills WHERE account_id = {}",
+            accountId);
+
+        if (skillResult)
+        {
+            do
+            {
+                Field* fields = skillResult->Fetch();
+                uint16 skillId = fields[0].Get<uint16>();
+                uint16 acctValue = fields[1].Get<uint16>();
+                uint16 acctMax = fields[2].Get<uint16>();
+                uint16 acctStep = fields[3].Get<uint16>();
+
+                if (!player->HasSkill(skillId))
+                    continue;
+
+                uint16 playerStep = player->GetSkillStep(skillId);
+                uint16 playerValue = player->GetSkillValue(skillId);
+                uint16 playerMax = player->GetPureMaxSkillValue(skillId);
+
+                if (acctStep > playerStep)
+                {
+                    // Upgrade tier — this also sets value and max
+                    player->SetSkill(skillId, acctStep, acctValue, acctMax);
+                }
+                else if (acctValue > playerValue)
+                {
+                    // Same or lower tier, but higher value
+                    uint16 newVal = std::min(acctValue, playerMax);
+                    player->SetSkill(skillId, playerStep, newVal, playerMax);
+                }
+            } while (skillResult->NextRow());
+        }
+
+        // Apply recipes
+        QueryResult spellResult = CharacterDatabase.Query(
+            "SELECT spell_id FROM shared_professions_account_spells WHERE account_id = {}",
+            accountId);
+
+        if (spellResult)
+        {
+            do
+            {
+                Field* fields = spellResult->Fetch();
+                uint32 spellId = fields[0].Get<uint32>();
+
+                if (player->HasSpell(spellId))
+                    continue;
+
+                // Only teach if player has the associated profession
+                uint32 skillId = GetProfessionSkillForSpell(spellId);
+                if (skillId && player->HasSkill(skillId))
+                    player->learnSpell(spellId);
+            } while (spellResult->NextRow());
+        }
+    }
+};
+
+void AddSC_SharedProfessions()
+{
+    new SharedProfessionsWorldScript();
+    new SharedProfessionsPlayerScript();
+}

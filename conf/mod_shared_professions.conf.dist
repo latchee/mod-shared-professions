@@ -1,0 +1,17 @@
+[worldserver]
+
+#
+# SharedProfessions.Enable
+#     Enable the shared professions module
+#     Default: 1
+#
+
+SharedProfessions.Enable = 1
+
+#
+# SharedProfessions.SyncSecondary
+#     Also sync secondary professions (Cooking, First Aid, Fishing)
+#     Default: 1
+#
+
+SharedProfessions.SyncSecondary = 1
