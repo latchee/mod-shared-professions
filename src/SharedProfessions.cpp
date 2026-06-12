@@ -1,3 +1,4 @@
+#include "AccountMgr.h"
 #include "Config.h"
 #include "DatabaseEnv.h"
 #include "DBCStores.h"
@@ -49,6 +50,22 @@ namespace
     {
         std::lock_guard<std::mutex> lock(syncMutex);
         return syncingPlayers.find(guid) != syncingPlayers.end();
+    }
+
+    bool IsRandomBot(Player* player)
+    {
+        if (!player)
+            return false;
+        uint32 accountId = player->GetSession()->GetAccountId();
+        std::string username;
+        if (!sAccountMgr->GetName(accountId, username))
+            return false;
+        if (username.size() < 6)
+            return false;
+        std::string prefix = username.substr(0, 6);
+        for (char& c : prefix)
+            c = std::tolower(static_cast<unsigned char>(c));
+        return prefix == "rndbot";
     }
 
     bool IsSyncedProfessionSkill(uint32 skillId)
@@ -103,6 +120,9 @@ public:
         if (!enabled)
             return;
 
+        if (IsRandomBot(player))
+            return;
+
         uint32 accountId = player->GetSession()->GetAccountId();
         uint32 guid = player->GetGUID().GetCounter();
 
@@ -120,6 +140,9 @@ public:
     void OnPlayerLearnSpell(Player* player, uint32 spellId) override
     {
         if (!enabled)
+            return;
+
+        if (IsRandomBot(player))
             return;
 
         if (IsSyncing(player->GetGUID().GetCounter()))
@@ -147,6 +170,9 @@ public:
     void OnPlayerUpdateSkill(Player* player, uint32 skillId, uint32 /*value*/, uint32 /*max*/, uint32 /*step*/, uint32 newValue) override
     {
         if (!enabled)
+            return;
+
+        if (IsRandomBot(player))
             return;
 
         if (IsSyncing(player->GetGUID().GetCounter()))
