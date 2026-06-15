@@ -90,6 +90,37 @@ namespace
         }
         return 0;
     }
+
+    // Returns the passive skill bonus granted by a race-specific profession aura.
+    // These modifiers are always active while the player is in the world, so we
+    // must strip them before persisting to the account store; otherwise the bonus
+    // stacks with itself on every relog.
+    //
+    //   Gnome     – Engineering Specialization : +15 Engineering  (spell 20574)
+    //   Draenei   – Gemcutting                 : +5  Jewelcrafting (spell 28677)
+    //   Blood Elf – Arcane Affinity            : +10 Enchanting   (spell 28877)
+    //   Tauren    – Cultivation                : +15 Herbalism    (spell 20552)
+    uint32 GetRacialProfessionBonus(uint8 race, uint32 skillId)
+    {
+        switch (race)
+        {
+            case RACE_GNOME:
+                if (skillId == SKILL_ENGINEERING)    return 15;
+                break;
+            case RACE_DRAENEI:
+                if (skillId == SKILL_JEWELCRAFTING)  return 5;
+                break;
+            case RACE_BLOOD_ELF:
+                if (skillId == SKILL_ENCHANTING)     return 10;
+                break;
+            case RACE_TAUREN:
+                if (skillId == SKILL_HERBALISM)      return 15;
+                break;
+            default:
+                break;
+        }
+        return 0;
+    }
 }
 
 class SharedProfessionsWorldScript : public WorldScript
@@ -182,8 +213,14 @@ public:
             return;
 
         uint32 accountId = player->GetSession()->GetAccountId();
-        uint16 maxVal = player->GetPureMaxSkillValue(skillId);
+        uint16 maxVal  = player->GetPureMaxSkillValue(skillId);
         uint16 stepVal = player->GetSkillStep(skillId);
+
+        // Strip the racial passive bonus before persisting — the aura re-adds
+        // it automatically on each login, so storing the inflated value would
+        // cause the skill to grow by the bonus amount on every relog.
+        uint32 bonus       = GetRacialProfessionBonus(player->getRace(), skillId);
+        uint16 storedValue = (newValue > bonus) ? static_cast<uint16>(newValue - bonus) : 0;
 
         CharacterDatabase.Execute(
             "INSERT INTO shared_professions_account_skills (account_id, skill_id, value, max_value, step) "
@@ -192,7 +229,7 @@ public:
             "value = GREATEST(value, VALUES(value)), "
             "max_value = GREATEST(max_value, VALUES(max_value)), "
             "step = GREATEST(step, VALUES(step))",
-            accountId, skillId, newValue, maxVal, stepVal);
+            accountId, skillId, storedValue, maxVal, stepVal);
     }
 
 private:
@@ -210,9 +247,15 @@ private:
             if (!player->HasSkill(skill->id))
                 continue;
 
-            uint16 value = player->GetSkillValue(skill->id);
-            uint16 maxVal = player->GetPureMaxSkillValue(skill->id);
-            uint16 step = player->GetSkillStep(skill->id);
+            uint16 rawValue = player->GetSkillValue(skill->id);
+            uint16 maxVal   = player->GetPureMaxSkillValue(skill->id);
+            uint16 step     = player->GetSkillStep(skill->id);
+
+            // Strip the racial passive bonus so only the earned portion is stored.
+            // The aura re-applies automatically on each login, so persisting the
+            // inflated value would add the bonus again on every relog.
+            uint32 bonus = GetRacialProfessionBonus(player->getRace(), skill->id);
+            uint16 value = (rawValue > static_cast<uint16>(bonus)) ? static_cast<uint16>(rawValue - bonus) : 0;
 
             // UPSERT skill with GREATEST to keep the best values
             CharacterDatabase.Execute(
@@ -271,17 +314,25 @@ private:
                     continue;
 
                 uint16 playerStep = player->GetSkillStep(skillId);
-                uint16 playerValue = player->GetSkillValue(skillId);
-                uint16 playerMax = player->GetPureMaxSkillValue(skillId);
+                uint16 playerMax  = player->GetPureMaxSkillValue(skillId);
+
+                // GetSkillValue includes any racial passive bonus.
+                // acctValue is stored without that bonus, so strip it from the
+                // live value before comparing to keep the comparison fair.
+                uint16 playerRaw    = player->GetSkillValue(skillId);
+                uint32 racialBonus  = GetRacialProfessionBonus(player->getRace(), skillId);
+                uint16 playerEarned = (playerRaw > static_cast<uint16>(racialBonus))
+                                      ? static_cast<uint16>(playerRaw - racialBonus)
+                                      : 0;
 
                 if (acctStep > playerStep)
                 {
                     // Upgrade tier — this also sets value and max
                     player->SetSkill(skillId, acctStep, acctValue, acctMax);
                 }
-                else if (acctValue > playerValue)
+                else if (acctValue > playerEarned)
                 {
-                    // Same or lower tier, but higher value
+                    // Same or lower tier, but higher earned value
                     uint16 newVal = std::min(acctValue, playerMax);
                     player->SetSkill(skillId, playerStep, newVal, playerMax);
                 }
