@@ -110,7 +110,7 @@ namespace
             case RACE_DRAENEI:
                 if (skillId == SKILL_JEWELCRAFTING)  return 5;
                 break;
-            case RACE_BLOOD_ELF:
+            case RACE_BLOODELF:
                 if (skillId == SKILL_ENCHANTING)     return 10;
                 break;
             case RACE_TAUREN:
